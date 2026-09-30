@@ -37,7 +37,9 @@
 #define ANGULAR_COMMAND_ALPHA 0.12
 #define LINEAR_COMMAND_ALPHA 0.08
 
-#define WHEEL_ACCEL_LIMIT 10.0 /* rad/s^2 */
+#define WHEEL_ACCEL_LIMIT 6.0  /* rad/s^2 */
+#define WHEEL_JERK_LIMIT 30.0  /* rad/s^3 */
+#define MOTOR_AVAILABLE_TORQUE 12.0 /* N.m */
 #define STARTUP_DELAY_STEPS 50
 #define LOST_LINE_SEARCH_STEPS 60
 #define LOST_LINE_MIN_ERROR_M 0.004
@@ -50,13 +52,49 @@ static double clamp_value(double value, double minimum, double maximum) {
   return value;
 }
 
-static double move_towards(double current, double target, double max_delta) {
-  const double delta = target - current;
-  if (delta > max_delta)
-    return current + max_delta;
-  if (delta < -max_delta)
-    return current - max_delta;
-  return target;
+typedef struct {
+  double velocity;
+  double acceleration;
+} WheelMotion;
+
+/*
+ * Generates an S-curve wheel command. Acceleration itself is changed
+ * gradually, so reaching a new speed does not produce a mechanical jerk.
+ */
+static double update_wheel_motion(WheelMotion *motion, double target_velocity) {
+  const double error = target_velocity - motion->velocity;
+  const double stopping_delta = motion->acceleration *
+                                fabs(motion->acceleration) /
+                                (2.0 * WHEEL_JERK_LIMIT);
+  double jerk_command = 0.0;
+
+  if (error > stopping_delta)
+    jerk_command = WHEEL_JERK_LIMIT;
+  else if (error < stopping_delta)
+    jerk_command = -WHEEL_JERK_LIMIT;
+  else if (fabs(motion->acceleration) > 1e-6)
+    jerk_command = copysign(WHEEL_JERK_LIMIT, -motion->acceleration);
+
+  motion->acceleration += jerk_command * DT;
+  motion->acceleration = clamp_value(motion->acceleration,
+                                     -WHEEL_ACCEL_LIMIT,
+                                     WHEEL_ACCEL_LIMIT);
+
+  const double previous_velocity = motion->velocity;
+  motion->velocity += motion->acceleration * DT;
+
+  /* Avoid a small oscillation when the S-curve reaches its target. */
+  if ((target_velocity - previous_velocity) *
+          (target_velocity - motion->velocity) <=
+      0.0) {
+    motion->velocity = target_velocity;
+    motion->acceleration = 0.0;
+  }
+
+  motion->velocity = clamp_value(motion->velocity,
+                                 -MAX_WHEEL_SPEED,
+                                 MAX_WHEEL_SPEED);
+  return motion->velocity;
 }
 
 /*
@@ -119,6 +157,10 @@ int main(int argc, char **argv) {
   wb_camera_enable(line_sensor, TIME_STEP);
   wb_motor_set_position(left_motor, INFINITY);
   wb_motor_set_position(right_motor, INFINITY);
+  wb_motor_set_acceleration(left_motor, WHEEL_ACCEL_LIMIT);
+  wb_motor_set_acceleration(right_motor, WHEEL_ACCEL_LIMIT);
+  wb_motor_set_available_torque(left_motor, MOTOR_AVAILABLE_TORQUE);
+  wb_motor_set_available_torque(right_motor, MOTOR_AVAILABLE_TORQUE);
   wb_motor_set_velocity(left_motor, 0.0);
   wb_motor_set_velocity(right_motor, 0.0);
 
@@ -132,8 +174,8 @@ int main(int argc, char **argv) {
   double filtered_error = 0.0;
   double angular_command = 0.0;
   double linear_command = 0.0;
-  double left_command = 0.0;
-  double right_command = 0.0;
+  WheelMotion left_motion = {0.0, 0.0};
+  WheelMotion right_motion = {0.0, 0.0};
   int lost_line_steps = 0;
   int step_count = 0;
 
@@ -204,9 +246,8 @@ int main(int argc, char **argv) {
       right_target = 0.0;
     }
 
-    const double max_wheel_delta = WHEEL_ACCEL_LIMIT * DT;
-    left_command = move_towards(left_command, left_target, max_wheel_delta);
-    right_command = move_towards(right_command, right_target, max_wheel_delta);
+    const double left_command = update_wheel_motion(&left_motion, left_target);
+    const double right_command = update_wheel_motion(&right_motion, right_target);
 
     wb_motor_set_velocity(left_motor, left_command);
     wb_motor_set_velocity(right_motor, right_command);

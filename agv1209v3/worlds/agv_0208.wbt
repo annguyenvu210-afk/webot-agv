@@ -75,6 +75,7 @@ DEF AGV_2wheelDf Robot {
       device [
         RotationalMotor {
           name "Lmotor"
+          acceleration 6
           controlPID 1 0 0
           maxVelocity 100
           maxTorque 20
@@ -115,6 +116,7 @@ DEF AGV_2wheelDf Robot {
       device [
         RotationalMotor {
           name "Rmotor"
+          acceleration 6
           controlPID 1 0 0
           maxVelocity 100
           maxTorque 20
