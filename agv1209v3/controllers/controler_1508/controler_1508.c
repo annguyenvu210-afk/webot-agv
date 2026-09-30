@@ -25,18 +25,19 @@
 #define HALF_TRACK_M 0.20
 #define MAX_WHEEL_SPEED 15.625 /* 1.25 m/s / 0.08 m */
 
-#define CRUISE_SPEED_MPS 0.80
-#define MIN_CURVE_SPEED_MPS 0.25
+#define CRUISE_SPEED_MPS 0.65
+#define MIN_CURVE_SPEED_MPS 0.28
 #define SEARCH_SPEED_MPS 0.15
 
-#define STEERING_KP 12.0
-#define STEERING_KD 0.35
-#define MAX_ANGULAR_SPEED 1.20
+#define STEERING_KP 9.0
+#define MAX_ANGULAR_SPEED 1.00
+#define LINE_ERROR_DEADBAND_M 0.0025
 
-#define ERROR_FILTER_ALPHA 0.30
-#define DERIVATIVE_FILTER_ALPHA 0.20
+#define ERROR_FILTER_ALPHA 0.15
+#define ANGULAR_COMMAND_ALPHA 0.12
+#define LINEAR_COMMAND_ALPHA 0.08
 
-#define WHEEL_ACCEL_LIMIT 20.0 /* rad/s^2 */
+#define WHEEL_ACCEL_LIMIT 10.0 /* rad/s^2 */
 #define STARTUP_DELAY_STEPS 50
 #define LOST_LINE_SEARCH_STEPS 60
 #define LOST_LINE_MIN_ERROR_M 0.004
@@ -129,8 +130,8 @@ int main(int argc, char **argv) {
   double previous_segment_center = (image_width - 1) / 2.0;
   double last_valid_error = 0.0;
   double filtered_error = 0.0;
-  double previous_filtered_error = 0.0;
-  double filtered_derivative = 0.0;
+  double angular_command = 0.0;
+  double linear_command = 0.0;
   double left_command = 0.0;
   double right_command = 0.0;
   int lost_line_steps = 0;
@@ -159,19 +160,17 @@ int main(int argc, char **argv) {
 
       filtered_error += ERROR_FILTER_ALPHA * (raw_error - filtered_error);
 
-      const double raw_derivative =
-          (filtered_error - previous_filtered_error) / DT;
-      filtered_derivative += DERIVATIVE_FILTER_ALPHA *
-                             (raw_derivative - filtered_derivative);
-      previous_filtered_error = filtered_error;
+      double steering_error = filtered_error;
+      if (fabs(steering_error) < LINE_ERROR_DEADBAND_M)
+        steering_error = 0.0;
 
-      angular_speed = STEERING_KP * filtered_error +
-                      STEERING_KD * filtered_derivative;
+      /* A proportional controller is sufficient for this low-speed demo. */
+      angular_speed = STEERING_KP * steering_error;
       angular_speed = clamp_value(angular_speed, -MAX_ANGULAR_SPEED,
                                   MAX_ANGULAR_SPEED);
 
       /* Slow down progressively in a curve, but never stop abruptly. */
-      linear_speed = CRUISE_SPEED_MPS / (1.0 + fabs(angular_speed));
+      linear_speed = CRUISE_SPEED_MPS / (1.0 + 1.5 * fabs(angular_speed));
       linear_speed = fmax(linear_speed, MIN_CURVE_SPEED_MPS);
     } else {
       ++lost_line_steps;
@@ -187,10 +186,15 @@ int main(int argc, char **argv) {
       }
     }
 
+    /* Filter both commands so camera pixel changes cannot shake the motors. */
+    angular_command +=
+        ANGULAR_COMMAND_ALPHA * (angular_speed - angular_command);
+    linear_command += LINEAR_COMMAND_ALPHA * (linear_speed - linear_command);
+
     double left_target =
-        (linear_speed + angular_speed * HALF_TRACK_M) / WHEEL_RADIUS_M;
+        (linear_command + angular_command * HALF_TRACK_M) / WHEEL_RADIUS_M;
     double right_target =
-        (linear_speed - angular_speed * HALF_TRACK_M) / WHEEL_RADIUS_M;
+        (linear_command - angular_command * HALF_TRACK_M) / WHEEL_RADIUS_M;
 
     left_target = clamp_value(left_target, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED);
     right_target = clamp_value(right_target, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED);
@@ -211,8 +215,8 @@ int main(int argc, char **argv) {
       const double line_error_mm = last_valid_error * 1000.0;
       printf("line=%s error=%7.2f mm v=%5.2f m/s w=%5.2f rad/s "
              "left=%6.2f right=%6.2f\n",
-             line_found ? "found" : "lost ", line_error_mm, linear_speed,
-             angular_speed, left_command, right_command);
+             line_found ? "found" : "lost ", line_error_mm, linear_command,
+             angular_command, left_command, right_command);
     }
 
     ++step_count;
