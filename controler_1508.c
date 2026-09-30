@@ -1,649 +1,225 @@
 /*
- * File:          controler_1508.c
- * Date:
- * Description:
- * Author:
- * Modifications:
+ * Simple line-following controller for the two-wheel AGV demo.
+ *
+ * The camera is used as a 1-D magnetic/line sensor. When more than one
+ * dark segment is visible (at a branch), the segment nearest to the one
+ * selected in the previous frame is kept. This makes the AGV continue on
+ * its current path instead of steering toward the average of two branches.
  */
 
-/*
- * You may need to add include files like <webots/distance_sensor.h> or
- * <webots/motor.h>, etc.
- */
-#include <stdio.h>
 #include <math.h>
-#include <stdlib.h>
+#include <stdbool.h>
+#include <stdio.h>
 
-#include <webots/robot.h>
 #include <webots/camera.h>
 #include <webots/motor.h>
-#include <webots/position_sensor.h>
-#include <webots/supervisor.h>
+#include <webots/robot.h>
 
-
-/*
- * You may want to add macros here.
- */
 #define TIME_STEP 10
+#define DT (TIME_STEP / 1000.0)
+
+#define LINE_THRESHOLD 100
+#define SENSOR_WIDTH_M 0.15
+
+#define WHEEL_RADIUS_M 0.08
+#define HALF_TRACK_M 0.20
+#define MAX_WHEEL_SPEED 15.625 /* 1.25 m/s / 0.08 m */
+
+#define CRUISE_SPEED_MPS 0.80
+#define MIN_CURVE_SPEED_MPS 0.25
+#define SEARCH_SPEED_MPS 0.15
+
+#define STEERING_KP 12.0
+#define STEERING_KD 0.35
+#define MAX_ANGULAR_SPEED 1.20
+
+#define ERROR_FILTER_ALPHA 0.30
+#define DERIVATIVE_FILTER_ALPHA 0.20
+
+#define WHEEL_ACCEL_LIMIT 20.0 /* rad/s^2 */
+#define STARTUP_DELAY_STEPS 50
+#define LOST_LINE_SEARCH_STEPS 60
+#define LOST_LINE_MIN_ERROR_M 0.004
+
+static double clamp_value(double value, double minimum, double maximum) {
+  if (value < minimum)
+    return minimum;
+  if (value > maximum)
+    return maximum;
+  return value;
+}
+
+static double move_towards(double current, double target, double max_delta) {
+  const double delta = target - current;
+  if (delta > max_delta)
+    return current + max_delta;
+  if (delta < -max_delta)
+    return current - max_delta;
+  return target;
+}
 
 /*
- * This is the main program.
- * The arguments of the main function can be specified by the
- * "controllerArgs" field of the Robot node
+ * Finds all contiguous dark segments in the camera row and returns one.
+ * At a branch, selecting the segment nearest to the previous selection is
+ * more stable than averaging all dark pixels together.
  */
-// dynamic model of bldcs
+static bool find_line_center(const unsigned char *image, int width, int height,
+                             bool have_previous, double previous_center,
+                             double *selected_center) {
+  const int y = height / 2;
+  const double image_center = (width - 1) / 2.0;
+  double best_score = INFINITY;
+  double best_center = image_center;
+  int segment_pixel_sum = 0;
+  int segment_pixel_count = 0;
 
+  for (int x = 0; x <= width; ++x) {
+    bool is_dark = false;
+    if (x < width) {
+      const int gray = wb_camera_image_get_gray(image, width, x, y);
+      is_dark = gray <= LINE_THRESHOLD;
+    }
 
-const double dt = 0.01;
-/*
-double x1L = 0;
-double x2L = 0;
-double x1R = 0;
-double x2R = 0;
-double LmotorTF(double omega, double v) {
-    double x2dot = 512*x1L;
-    double x1dot = -514.2857*x1L -930.757*x2L + 16*v;
-    x1L = x1L + x1dot*dt;
-    x2L = x2L + x2dot*dt;
-    omega = 25.9157*x2L;
-  return omega;
+    if (is_dark) {
+      segment_pixel_sum += x;
+      ++segment_pixel_count;
+      continue;
+    }
+
+    if (segment_pixel_count > 0) {
+      const double center = (double)segment_pixel_sum / segment_pixel_count;
+      const double reference = have_previous ? previous_center : image_center;
+      const double score = fabs(center - reference);
+
+      if (score < best_score) {
+        best_score = score;
+        best_center = center;
+      }
+
+      segment_pixel_sum = 0;
+      segment_pixel_count = 0;
+    }
   }
-  
-double RmotorTF(double omega, double v) {
-    //double omegaDot = (-497.1976)*omega + (241.8188)*v;
-    double x2dot = 512*x1R;
-    double x1dot = -514.2857*x1R -930.757*x2R + 16*v;
-    x1R = x1R + x1dot*dt;
-    x2R = x2R + x2dot*dt;
-    omega = 25.9157*x2L;
-  return omega; //gear ratio
-  }
-  */
-  // DISCRETE TRANSFER FUNCTION
-  double DZmotorTF(double omegaPre1,double omegaPre2, double v, double vPre) {
-   
-    double omega = 0.1517*omegaPre1 - 0.005841*omegaPre2+ 0.41*v -0.02951*vPre;
-   
-  return omega;
-  }
+
+  if (!isfinite(best_score))
+    return false;
+
+  *selected_center = best_center;
+  return true;
+}
 
 int main(int argc, char **argv) {
-  /* necessary to initialize webots stuff */
   wb_robot_init();
 
-  /*
-   * You should declare here WbDeviceTag variables for storing
-   * robot devices like this:
-   *  WbDeviceTag my_sensor = wb_robot_get_device("my_sensor");
-   *  WbDeviceTag my_actuator = wb_robot_get_device("my_actuator");
-   */
+  WbDeviceTag line_sensor = wb_robot_get_device("mgs1600");
+  WbDeviceTag left_motor = wb_robot_get_device("Lmotor");
+  WbDeviceTag right_motor = wb_robot_get_device("Rmotor");
 
-   
-    WbDeviceTag magSensor = wb_robot_get_device("mgs1600");
-    wb_camera_enable(magSensor, TIME_STEP);
-    
-    int image_width = wb_camera_get_width(magSensor);
-    int image_height = wb_camera_get_height(magSensor);
-    //printf("%d; %d; ", image_width, image_height);
-     
-     WbDeviceTag encoderL;
-     encoderL = wb_robot_get_device("sensorL");
-     WbDeviceTag encoderR;
-     encoderR = wb_robot_get_device("sensorR");
-     wb_position_sensor_enable(encoderL, TIME_STEP);
-     wb_position_sensor_enable(encoderR, TIME_STEP);
-     double encL0 = 0;
-     double encR0 = 0;   
-     
-    WbDeviceTag Lmotor;
-    Lmotor = wb_robot_get_device("Lmotor");
-    WbDeviceTag Rmotor;
-    Rmotor = wb_robot_get_device("Rmotor");
-    
-    wb_motor_enable_torque_feedback(Lmotor, TIME_STEP);
-    wb_motor_enable_torque_feedback(Rmotor, TIME_STEP);
-    
-    //Errors init
-    double eApre = 0;
-    double eVpre = 0;
-    double eWpre = 0;
-    double linePre = 0;
-    
-    double preAvgVL = 0;
-    double preAvgVR = 0;
-    double preErrVL = 0;
-    double preErrVR = 0;
-    
-    double ErrVL = 0;
-    double ErrVR = 0;
-    double wLz1 = 0;
-    double wLz2 = 0;
-    double vLz1 = 0;
-    double vLz2 = 0;
-    
-    double wRz1 =0;
-    double wRz2 = 0;
-    double vRz1 = 0;
-    double vRz2 = 0;
-    double uLpre = 0;
-    double uRpre = 0;
-    double uLa = 0;
-    double uRa = 0;
-    double iL = 0;
-    double iR = 0;
-    double uPre = 0;
-    
-    double IuW = 0;
-    double IuV = 0;
-  // Test set:
-  wb_motor_set_position(Lmotor, INFINITY);
-  wb_motor_set_position(Rmotor, INFINITY);
-  const int agvSpeed = 1;
-  double wheelSpeed = agvSpeed/0.08;
-  
-  //wb_motor_set_acceleration(Lmotor, 6.25);
-  //wb_motor_set_acceleration(Rmotor, 6.25);
-  
-  //wb_motor_set_available_torque(Lmotor, 18);
-  //wb_motor_set_available_torque(Rmotor, 18);
-  //wb_motor_set_velocity(Lmotor,5);
- // wb_motor_set_velocity(Rmotor,5);
-//---------------------------------------
-  
-FILE *fptr;
+  wb_camera_enable(line_sensor, TIME_STEP);
+  wb_motor_set_position(left_motor, INFINITY);
+  wb_motor_set_position(right_motor, INFINITY);
+  wb_motor_set_velocity(left_motor, 0.0);
+  wb_motor_set_velocity(right_motor, 0.0);
 
-// Open a file in writing mode
-//fptr = fopen(""D:\hoc-tap\LVTN\CTRLSIM\agv1209\simData.csv"", "w");
-fptr = fopen("D:\\hoc-tap\\LVTN\\CTRLSIM\\agv1209v3\\simData.csv", "w");
+  const int image_width = wb_camera_get_width(line_sensor);
+  const int image_height = wb_camera_get_height(line_sensor);
+  const double meters_per_pixel = SENSOR_WIDTH_M / (image_width - 1);
 
-  /* main loop
-   * Perform simulation steps of TIME_STEP milliseconds
-   * and leave the loop when the simulation is over
-   */
-   int t = 0;
-   double uA = 0;
-   double uApre = 0;
-   
-   double tAl = 0;
-   double tDl = 0;
-   double tAr = 0;
-   double tDr= 0;
-   
-   double aL = 0;
-   double aR = 0;
-   
-   double aLpre = 0;
-   double aRpre = 0;
-   
-   double rLpre = 0;
-   double rRpre = 0;
-   
-   double w_refL = 0;   // persistent state
-   double w_refR = 0;
-   
-   double smooth_stepL(double target_w) {
-    double max_delta = 6.25* dt;
-    double err = target_w - w_refL;
+  bool have_previous_segment = false;
+  double previous_segment_center = (image_width - 1) / 2.0;
+  double last_valid_error = 0.0;
+  double filtered_error = 0.0;
+  double previous_filtered_error = 0.0;
+  double filtered_derivative = 0.0;
+  double left_command = 0.0;
+  double right_command = 0.0;
+  int lost_line_steps = 0;
+  int step_count = 0;
 
-    if (err > max_delta)       w_refL += max_delta;
-    else if (err < -max_delta) w_refL -= max_delta;
-    else                        w_refL = target_w;
-
-    return w_refL;
-}
-
- double smooth_stepR(double target_w) {
-    double max_delta = 6.25* dt;
-    double err = target_w - w_refR;
-
-    if (err > max_delta)       w_refR += max_delta;
-    else if (err < -max_delta) w_refR -= max_delta;
-    else                        w_refR = target_w;
-
-    return w_refR;
-}
-
-double uVpre = 0;
-double uWpre = 0;
-
-    double rWheel = 0.08;
-    double lWheel = 0.2;
-    double wL;
-    double wR;
-   
-    double vAGV;
-    double eV;
-    double eA;
-    double eW;
-    double vPID[3] = {10, .25,0};
-    double wPID[3] = {8, 5, 5}; // current optimal 1, 1, 1
-   
-   
   while (wb_robot_step(TIME_STEP) != -1) {
-    /*
-     * Read the sensors :
-     * Enter here functions to read sensor data, like:
-     *  double val = wb_distance_sensor_get_value(my_sensor);
-     */
-    const unsigned char *image = wb_camera_get_image(magSensor);
-    
-    
-    //int wb_camera_get_width(magSensor);
-    //int wb_camera_get_height(WbDeviceTag tag);
+    const unsigned char *image = wb_camera_get_image(line_sensor);
+    double line_center = previous_segment_center;
+    const bool line_found = image != NULL &&
+                            find_line_center(image, image_width, image_height,
+                                             have_previous_segment,
+                                             previous_segment_center,
+                                             &line_center);
 
+    double linear_speed = 0.0;
+    double angular_speed = 0.0;
 
-    /* Process sensor data here */
-    
-    double encL = wb_position_sensor_get_value(encoderL);
-    double encR = wb_position_sensor_get_value(encoderR);
-    double oL = (encL - encL0)/dt;// m/s
-    double oR = (encR - encR0)/dt;
-    
-    double vL = oL*0.08;
-    double vR = oR*0.08;
-   
-    encL0 = encL;
-    encR0 = encR;
-    
-    double avgVLin = 0;
-    double avgVRin = 0;
+    if (line_found) {
+      const double image_center = (image_width - 1) / 2.0;
+      const double raw_error = (line_center - image_center) * meters_per_pixel;
 
-    double avgVLout = 0;
-    double avgVRout = 0;
-    
-    int pixelCnt = 0;
-    double linePos = 0;
-    int stationMarker = 0;
-    double magValue = 0;
-    for (int x = 0; x < image_width; x++) {
-      for (int y = 0; y < image_height; y++) {
-      int pixelGray = wb_camera_image_get_gray(image,image_width,x, y );
-      //int pixelBlue = wb_camera_image_get_blue(image,image_width,x, y );
-    
-        
-        //printf("%d; ",pixelGray);
-        
-        if (pixelGray <= 60) {
-          magValue = 1;
-          pixelCnt += 1;
-        }
-        else if (pixelGray >= 100) {
-          magValue = 0;
-        }
-        else {
-        magValue = 0;
-        //pixelCnt += 1;
-        }
-        double mmX = 2*x - 74;
-        
-        linePos += mmX*magValue; //mm
-                
-     }
-     }
-     
-     // linePos = linePos/pixelCnt;
-     // printf("%d; %f; %f \n", pixelCnt, linePos, (vL + vR)/2);
-     // if (pixelCnt ==0) {
-      // fclose(fptr);  
-      // printf("%d", t);
-      // wb_motor_set_velocity(Lmotor, 0);
-      // wb_motor_set_velocity(Rmotor, 0);
-      // wb_robot_cleanup();
-      // exit(0);
-      
-     // }
-     if (pixelCnt == 0) {
-          fclose(fptr);
-          printf("%d", t);
-      
-          wb_motor_set_velocity(Lmotor, 0);
-          wb_motor_set_velocity(Rmotor, 0);
-      
-          wb_robot_cleanup();
-          exit(0);
+      have_previous_segment = true;
+      previous_segment_center = line_center;
+      last_valid_error = raw_error;
+      lost_line_steps = 0;
+
+      filtered_error += ERROR_FILTER_ALPHA * (raw_error - filtered_error);
+
+      const double raw_derivative =
+          (filtered_error - previous_filtered_error) / DT;
+      filtered_derivative += DERIVATIVE_FILTER_ALPHA *
+                             (raw_derivative - filtered_derivative);
+      previous_filtered_error = filtered_error;
+
+      angular_speed = STEERING_KP * filtered_error +
+                      STEERING_KD * filtered_derivative;
+      angular_speed = clamp_value(angular_speed, -MAX_ANGULAR_SPEED,
+                                  MAX_ANGULAR_SPEED);
+
+      /* Slow down progressively in a curve, but never stop abruptly. */
+      linear_speed = CRUISE_SPEED_MPS / (1.0 + fabs(angular_speed));
+      linear_speed = fmax(linear_speed, MIN_CURVE_SPEED_MPS);
+    } else {
+      ++lost_line_steps;
+
+      /*
+       * Keep turning slowly in the last known direction for a short time.
+       * If the line is not found again, stop instead of exiting the program.
+       */
+      if (lost_line_steps <= LOST_LINE_SEARCH_STEPS &&
+          fabs(last_valid_error) >= LOST_LINE_MIN_ERROR_M) {
+        linear_speed = SEARCH_SPEED_MPS;
+        angular_speed = copysign(0.60, last_valid_error);
       }
-      
-      linePos = linePos / pixelCnt;
-     
-    /*
-     * Enter here functions to send actuator commands, like:
-     * wb_motor_set_position(my_actuator, 10.0);
-  
-    double rpsLeft = wheelSpeed;
-    double rpsRight = wheelSpeed;
-    
-    double omega = linePos;
-    if (omega < 0) {
-    rpsLeft += 0.3*omega;
-    rpsRight += 0.1*omega;
-    
     }
-    if (omega > 0) {
-    rpsRight -= 0.3*omega;
-     rpsLeft -= 0.1*omega;
+
+    double left_target =
+        (linear_speed + angular_speed * HALF_TRACK_M) / WHEEL_RADIUS_M;
+    double right_target =
+        (linear_speed - angular_speed * HALF_TRACK_M) / WHEEL_RADIUS_M;
+
+    left_target = clamp_value(left_target, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED);
+    right_target = clamp_value(right_target, -MAX_WHEEL_SPEED, MAX_WHEEL_SPEED);
+
+    if (step_count < STARTUP_DELAY_STEPS) {
+      left_target = 0.0;
+      right_target = 0.0;
     }
-      */
-    
-    // PID controller
 
-    
-    
-    //double dPID[3] = {1, 0, 0};
-    
-    vAGV = (vL + vR)/2;
-     double targetAngle = atan(linePos/337.5);
-    double headAngle = atan((vR - vL)*dt/0.4);
-    //headAngle = 0;   
-    eA = - targetAngle;
-    //eW = (eA - eApre)/dt;
-    eW = linePos;
-    
-    //eW = eA; 
-    
-    eV = agvSpeed - vAGV;
-    
-    IuW = IuW + eW;
-    IuV = IuV + eV;
-    if (fabs(IuV) > 200) {IuV = copysign(200, IuV); }
-    
-    if (fabs(IuW) > 18)  {IuW = copysign(18, IuW); }
-    double ffW = eW - eWpre;
-    //eW = eW + ffW*dt;
-    
-    
-    double uV = vPID[0]*eV + vPID[1]*IuV*dt + vPID[2]*(eV - eVpre)/dt;
-    uV = 1;
-    //ffW = uV/0.9;
-    //eW = eW + ffW;
-    
-    double uW = .2*eW + .2175*IuW*dt + .016*(eW - eWpre)/dt;
-    //double uW = 0.03 * eW;
-    //if (uW > 2) uW = 2;
-    //if (uW < -2) uW = -2 ;
-    //uW = uW*cos(eA);
-    uV = uV*cos(fmin(fabs(uW), 3.141/2));
-    //uV = uV*cos((eA+ eApre));
-    
-    /* double curveDecel ;
-    
-    double c1 = abs(linePos)/75;
-    double c2 = abs(linePre)/75;
-    
-    curveDecel = dPID[0]*c1 + dPID[1]*(c1 + c2) + dPID[2]*(c1-c2);
-    curveDecel  = (c1 + c2)/2;
-    
-    uV = uV*(1 - curveDecel); 
-    
-        if (abs(linePos) >= 40) {
-    uV = -uV*0.1;
-    }    
-    
-            if (fabs(linePos) >= 20) {
-    uV = 0.25;
-    } else  if (fabs(linePos) >= 15) {
-      uV = uV*0.5;
-    }  else if (fabs(linePos) >= 10) {
-    uV = uV*0.625;
-    } else if (fabs(linePos) >= 5) {
-    uV = uV*0.75;
-    } 
-      
-      
-    uV = uV*(-fabs(linePos)/45+ 1);
-    if (fabs(linePos) >= 45) {uV = 0;}      
-    */  
-    
+    const double max_wheel_delta = WHEEL_ACCEL_LIMIT * DT;
+    left_command = move_towards(left_command, left_target, max_wheel_delta);
+    right_command = move_towards(right_command, right_target, max_wheel_delta);
 
- 
-   //if (uV - uVpre > 1*dt) {uV = uVpre + 1*dt; }
-   //if (uVpre - uV > 1*dt) {uV = uVpre -1*dt; }
-    uVpre = uV;  
-    
-    uA = uApre + copysign(1*dt, 1 - fabs(uV));
-    //uV = fmin(uV, uVpre + uA*dt);
-    uApre = uA;
-    uWpre = uW;
-    
-    //double uWmax = fmax(uV, 0.1)/lWheel;
-    //if (uW >  uWmax) uW =  uWmax;
-    //if (uW < -uWmax) uW = -uWmax;
-       
-    wR = (uV - uW*lWheel)/rWheel;
-    wL = (uV + uW*lWheel)/rWheel;
-  
-    eVpre = eV;
-    eApre = eA;
-    eWpre = eW;
-    uWpre = uW;
+    wb_motor_set_velocity(left_motor, left_command);
+    wb_motor_set_velocity(right_motor, right_command);
 
-/*if (t == 0) {
-w_refL = wL;
-w_refR = wR;
-}*/
-
-//wL = smooth_stepL(wL);
-//wR = smooth_stepR(wR);
-
-//if (wL - uLpre > 6.25*dt) {wL = uLpre + 6.25*dt; }
-//if (wR - uRpre > 6.25*dt) {wR = uRpre + 6.25*dt; }
-  /*double jerk = 12.5;
-  
-  if (wL > uLpre) { 
-  if (uLpre >0) {aL = aLpre + copysign(jerk*dt, 0.5/0.08 - fabs(uLpre) );}
-  if (uLpre < 0) { aL = aLpre + copysign(jerk*dt, -0.5/0.08 + fabs(uLpre) );  }
-  wL = fmin(wL, uLpre + fabs(aL*dt)); }
-  
-  aLpre = aL;
-  
-  if (wR > uRpre) { 
-  if (uRpre > 0) {aR = aRpre + copysign(jerk*dt, 0.5/0.08 - fabs(uRpre) );}
-  if (uRpre < 0) { aR = aRpre + copysign(jerk*dt, -0.5/0.08 + fabs(uRpre) );  }
-  wR = fmin(wR, uRpre + fabs(aR*dt)); }
-  aRpre = aR;*/
-  
- double jerk  = 12.5;   // rad/s^3
-//double a_max = 6.25;   // rad/s^2
-
-// wL_target = the desired/kinematic target speed for this tick (before shaping)
-// uLpre     = shaper's previous output speed (persists between ticks)
-// aLpre     = shaper's previous acceleration (persists between ticks)
-
-double a_max_accel = 12.5/2;
-double a_max_decel = 12.5/2;    // try larger, e.g. 12-15, tune from here
-
-double errL   = wL - uLpre;
-double dstopL = aLpre * fabs(aLpre) / (2.0 * jerk);
-
-double jcmdL;
-if (errL > dstopL) {
-    jcmdL = jerk;
-} else if (errL < -dstopL) {
-    jcmdL = -jerk;
-} else {
-    jcmdL = copysign(jerk, -aLpre);
-}
-
-aL = aLpre + jcmdL * dt;
-
-// asymmetric clamp: different bounds depending on direction of accel
-if (aL > a_max_accel) aL = a_max_accel;
-if (aL < -a_max_decel) aL = -a_max_decel;
-
-wL = uLpre + aL * dt;
-
-uLpre = wL;
-aLpre = aL;
-
-double errR   = wR- uRpre;
-double dstopR = aRpre * fabs(aRpre) / (2.0 * jerk);
-
-double jcmdR;
-if (errR > dstopR) {
-    jcmdR = jerk;
-} else if (errR < -dstopR) {
-    jcmdR = -jerk;
-} else {
-    jcmdR = copysign(jerk, -aRpre);
-}
-
-aR = aRpre + jcmdR * dt;
-
-// asymmetric clamp: different bounds depending on direction of accel
-if (aR > a_max_accel) aR = a_max_accel;
-if (aR < -a_max_decel) aR = -a_max_decel;
-
-wR = uRpre + aR * dt;
-
-uRpre = wR;
-aRpre = aR;
- 
- //double aLz0 = (wL - uLpre)/dt;
- //double aRz0 = (wR - uRpre)/dt;
- 
- //if (wL > uLpre ) { wL = fmin(wL, uLpre + fmin(12.5, fabs(aLz0) + jerk*dt)*dt); }
- //else if (wL < uLpre) { wL = fmax(wL, uLpre - fmin(12.5, fabs(aLz0) + jerk*dt)*dt); }
- 
- //if (wR > uRpre) { wR = fmin(wR, uRpre + fmin(12.5, fabs(aRz0) + jerk*dt)*dt); }
- //else if (wR < uRpre) {  wR = fmax(wR, uRpre - fmin(12.5, fabs(aRz0) + jerk*dt)*dt); }
- //wb_motor_set_acceleration(Lmotor, fmin(abs(aLz0) + jerk*dt, 12.5));
- //wb_motor_set_acceleration(Rmotor, fmin(abs(aRz0) + jerk*dt, 12.5));
- 
- if (fabs(wR) > 1.25/rWheel) {
-     wR = copysign(1.25/rWheel, wR);
+    if (step_count % 10 == 0) {
+      const double line_error_mm = last_valid_error * 1000.0;
+      printf("line=%s error=%7.2f mm v=%5.2f m/s w=%5.2f rad/s "
+             "left=%6.2f right=%6.2f\n",
+             line_found ? "found" : "lost ", line_error_mm, linear_speed,
+             angular_speed, left_command, right_command);
     }
-    
-if (fabs(wL) > 1.25/rWheel) {   
-      wL = copysign(1.25/rWheel, wL);
- }
- 
-/*
-double vamax = 0.5/0.08;
-double lz1 = fmin(fabs(wLz1),1/0.08);
-double rz1 = fmin(fabs(wRz1),1/0.08);
-aL = fabs(-fabs(lz1) + vamax*2);
-aR = fabs(-fabs(rz1) + vamax*2);
-aL = fmin(aL, aLpre + jerk*dt);
-aL = fmin(aL, 6.25);
-aR = fmin(aR, aRpre + jerk*dt);
-aR = fmin(aR, 6.25);
-wb_motor_set_acceleration(Lmotor, aL);
-wb_motor_set_acceleration(Rmotor, aR);
-aLpre = aL;
-aRpre = aR;
 
-*/
+    ++step_count;
+  }
 
-/*
-aLpre = aL;
-aRpre = aR;
-uLpre = wL;
-uRpre = wL;
-uLa = aLnew;
-uRa = aRnew;
-*/
-//rLpre = vL/0.08;
-//rRpre = vR/0.08;
-
-uLpre = wL;
-uRpre = wR;
-
-ErrVL = wL - oL;
-ErrVR = wR - oR;
-
-//if (abs(ErrVL)/dt > 6.25) {ErrVL = copysign(6.25*dt,wL - vL/0.08);}
-//if (abs(ErrVR)/dt > 6.25) {ErrVR = copysign(6.25*dt,wR - vR/0.08);}
-
-iL = iL + ErrVL;
-iR = iR + ErrVR;
-if (fabs(iL) > 500) {iL = copysign(500, iL); }
-if (fabs(iR) > 500) {iR = copysign(500, iR); }
-
-double ffL = 0.41*oL - 0.02951*oL + 0.1517*vLz1 -0.005841*vLz2;
-double ffR = 0.41*oR - 0.02951*oR + 0.1517*vRz1 -0.005841*vRz2;
-
-avgVLout =  .0224*ErrVL + 2.24*iL*dt + (5.61*pow(10, -5))*(ErrVL - preErrVL)/dt;
-avgVRout =  .0224*ErrVR + 2.24*iR*dt + (5.61*pow(10, -5))*(ErrVR - preErrVR)/dt;
-avgVLout = fmin(fabs(avgVLout), 48 )*copysign(1, avgVLout);
-avgVRout = fmin(fabs(avgVRout), 48 )*copysign(1, avgVRout);
-
-//avgVLout = 10*t*dt*t*dt;
-//avgVRout = 10*t*dt*t*dt;
-
-//avgVLout = 48;
-//avgVRout = 48;
-
- preAvgVL = avgVLout;
- preAvgVR = avgVRout;
- preErrVL = ErrVL;
- preErrVR = ErrVR; 
-
-double omegaL = 0;
-double omegaR = 0;
-
-//omegaL = LmotorTF(vL/0.08 ,avgVLout);
-//omegaR = RmotorTF(vR/0.08 ,avgVRout);
-// DZmotorTF(double omegaPre1,double omegaPre2, double v, double vPre)
-omegaL = DZmotorTF(wLz1, wLz2, vLz1, vLz2);
-omegaR = DZmotorTF(wRz1, wRz2, vRz1, vRz2);
-//omegaL = DZmotorTF(wLz1, wLz2, avgVLout, vLz1);
-//omegaR = DZmotorTF(wRz1, wRz2, avgVRout, vRz1);
-//var updates:
-wLz2 = wLz1;
-wLz1 = omegaL;
-vLz2 = vLz1;
-vLz1 = avgVLout;
-
-wRz2 = wRz1;
-wRz1 = omegaR;
-vRz2 = vRz1;
-vRz1 = avgVRout; //time delay
-
-
-   //wb_motor_set_available_torque(Lmotor, 18);
-   //wb_motor_set_available_torque(Rmotor, 18);
-   // wb_motor_set_velocity(Lmotor, omegaL);
-   // wb_motor_set_velocity(Rmotor, omegaR);
-   
-   wb_motor_set_velocity(Lmotor, wL);
-   wb_motor_set_velocity(Rmotor, wR);
-    
-    if(t < 50) {
-      wb_motor_set_velocity(Lmotor, 0);
-      wb_motor_set_velocity(Rmotor, 0);
-      
-     }
-
-   
-    //* torque feedback
-    
-    double tL = wb_motor_get_torque_feedback(Lmotor);
-    double tR = wb_motor_get_torque_feedback(Rmotor);
-     //*/   
- 
-   if (t % 10 == 0) {   
-    //printf(" heading error: %f; \n ", eA);
-    printf(" Left speed: %f; Right speed: %f; \n ", vL, vR);
-    printf("line position: %f mm; station: %d \n", linePos, stationMarker);
-    printf("left torque: %f; right torque: %f;\n \n ", tL, tR);
-    
-    
-    }
-    //printf("%.4f, %.4f, %.4f, %.4f \n ", x1L, x2L, x1R, x2R);
-    printf("left: %f; right: %f;\n \n ", avgVLout, avgVRout);
-    double vecV = sqrt(pow((vL + vR)/2, 2) + pow((vL - vR)/lWheel, 2));
-      fprintf(fptr, "%.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f, %.4f \n", (omegaL + omegaR)*0.08/2, omegaL,  omegaR, aL, aR, linePos, linePos, uW);
-    t+=1;
-    
-
-      
-  };
-
-  /* Enter your cleanup code here */
-
-  /* This is necessary to cleanup webots resources */
+  wb_motor_set_velocity(left_motor, 0.0);
+  wb_motor_set_velocity(right_motor, 0.0);
   wb_robot_cleanup();
-
   return 0;
 }
-
-
