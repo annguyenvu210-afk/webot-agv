@@ -1,0 +1,225 @@
+#VRML_SIM R2025a utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/RectangleArena.proto"
+
+WorldInfo {
+  CFM 5e-05
+  basicTimeStep 10
+  FPS 30
+  contactProperties [
+    ContactProperties {
+      coulombFriction [
+        -1
+      ]
+      rollingFriction 0.05 0.05 0
+      bounce 0.001
+      forceDependentSlip [
+        0.001
+      ]
+    }
+    ContactProperties {
+      material2 "caster"
+      coulombFriction [
+        0.03
+      ]
+      bounce 0.01
+      softCFM 1e-05
+    }
+  ]
+}
+Viewpoint {
+  orientation 0.5115806800439487 0.30527820444609494 -0.8031752148167542 2.1502366235927273
+  position 7.868220493987607 11.900011981533584 8.258738130506327
+}
+Background {
+  skyColor [
+    0.25 0.5 1
+  ]
+}
+DirectionalLight {
+  ambientIntensity 1
+  direction 0 0 5
+}
+RectangleArena {
+  floorSize 30 30
+  floorTileSize 30 30
+  floorAppearance PBRAppearance {
+    baseColorMap ImageTexture {
+      url [
+        "../lineMapx4096.png"
+      ]
+      filtering 0
+    }
+    metalness 0
+  }
+  wallHeight 1
+}
+DEF AGV_2wheelDf Robot {
+  translation 4 10.01 0.21
+  children [
+    DEF Frame Shape {
+      appearance PBRAppearance {
+        baseColor 0 0 0
+        roughness 1
+        emissiveColor 0.05 1 0.25
+      }
+      geometry Box {
+        size 0.8 0.32 0.3
+      }
+    }
+    DEF WheelL HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 0.2 -0.12
+      }
+      device [
+        RotationalMotor {
+          name "Lmotor"
+          controlPID 1 0 0
+          maxVelocity 100
+          maxTorque 20
+        }
+        PositionSensor {
+          name "sensorL"
+          resolution 0.01745
+        }
+      ]
+      endPoint Solid {
+        translation 0 0.2 -0.12
+        rotation 1 0 0 1.5706905008365544
+        children [
+          DEF WheelShape Shape {
+            appearance PBRAppearance {
+              baseColor 0.5 0.75 1
+              roughness 1
+              emissiveColor 0.05 0.1 0.25
+            }
+            geometry Cylinder {
+              height 0.04
+              radius 0.08
+            }
+          }
+        ]
+        boundingObject USE WheelShape
+        physics Physics {
+          density -1
+          mass 2.2
+        }
+      }
+    }
+    DEF WheelR HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 1 0
+        anchor 0 -0.2 -0.12
+      }
+      device [
+        RotationalMotor {
+          name "Rmotor"
+          controlPID 1 0 0
+          maxVelocity 100
+          maxTorque 20
+        }
+        PositionSensor {
+          name "sensorR"
+          resolution 0.01745
+        }
+      ]
+      endPoint Solid {
+        translation 0 -0.2 -0.12
+        rotation 0.9999999999999961 6.273759002359423e-08 6.27114141965075e-08 1.5707999822960357
+        children [
+          USE WheelShape
+        ]
+        name "solid(1)"
+        boundingObject USE WheelShape
+        physics Physics {
+          density -1
+          mass 2.2
+        }
+      }
+    }
+    Solid {
+      translation 0.3 0.1 -0.15
+      children [
+        DEF CasterShape Shape {
+          appearance PBRAppearance {
+            roughness 1
+          }
+          geometry Sphere {
+            radius 0.05
+          }
+        }
+      ]
+      name "Caster1"
+      contactMaterial "caster"
+      boundingObject USE CasterShape
+      physics Physics {
+        density -1
+        mass 1
+      }
+    }
+    Solid {
+      translation -0.3 -0.1 -0.15
+      children [
+        USE CasterShape
+      ]
+      name "Caster2"
+      contactMaterial "caster"
+      boundingObject USE CasterShape
+      physics Physics {
+        density -1
+        mass 1
+      }
+    }
+    Solid {
+      translation -0.3 0.1 -0.15
+      children [
+        USE CasterShape
+      ]
+      name "Caster3"
+      contactMaterial "caster"
+      boundingObject USE CasterShape
+      physics Physics {
+      }
+    }
+    Solid {
+      translation 0.3 -0.1 -0.15
+      children [
+        USE CasterShape
+      ]
+      name "Caster4"
+      contactMaterial "caster"
+      boundingObject USE CasterShape
+      physics Physics {
+      }
+    }
+    Camera {
+      translation 0.3375 0 -0.17
+      rotation 0 1 0 1.5708
+      children [
+        DEF MGS1600 Shape {
+          appearance PBRAppearance {
+            baseColor 0 0.25 1
+            transparency 1
+          }
+          geometry Box {
+            size 0.15 0.01 0.001
+          }
+        }
+      ]
+      name "mgs1600"
+      fieldOfView 2.3806
+      width 75
+      height 1
+      far 0.1
+    }
+  ]
+  name "AGV"
+  boundingObject USE Frame
+  physics Physics {
+    density -1
+    mass 450
+  }
+  controller "controler_1508"
+  window "agvUI"
+}
